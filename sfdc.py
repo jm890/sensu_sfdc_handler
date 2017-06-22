@@ -30,6 +30,19 @@ LOG = logging.getLogger()
 
 class SfdcHandler(Handler):
 
+    def _format_body(self, data):
+        s = ""
+        keys = list(data.keys())
+        keys.sort()
+        for k in keys:
+            if k == 'Description':
+                continue
+            else:
+                s += "{}: {}\n".format(k, data[k])
+        if 'Description' in keys:
+            s += "\nDescription:\n" + self._format_body(data['Description'])
+        return s
+
     def handle(self):
         client_id = self.settings.get('sfdc', {}).get('sfdc_client_id')
         client_secret = self.settings.get('sfdc', {}).get('sfdc_client_secret')
@@ -38,7 +51,7 @@ class SfdcHandler(Handler):
         auth_url = self.settings.get('sfdc', {}).get('sfdc_auth_url')
         organization_id = self.settings.get('sfdc', {}).get('sfdc_organization_id')
         environment = self.settings.get('sfdc', {}).get('environment')
-        token_cache_file = self.settings.get('sfdc', {}).get('token_cache_file')
+        token_cache_file = self.settings.get('sfdc', {}).get('token_cache_file', None)
 
         print self.event
         print "client_id: ", client_id
@@ -46,7 +59,8 @@ class SfdcHandler(Handler):
         print "auth_url: ", auth_url
         print "organization: ", organization_id
         print "username: ", username
-        sfdc_oauth2 = OAuth2(client_id, client_secret, username, password, auth_url, organization_id)
+        sfdc_oauth2 = OAuth2(client_id, client_secret, username, password,
+                             auth_url, organization_id)
 
         data = self.event
         client_host = data.get('client', {}).get('name')
@@ -54,7 +68,7 @@ class SfdcHandler(Handler):
         check_action = data.get('action')
         timestamp = data.get('check', {}).get('issued')
         check_date = datetime.fromtimestamp(int(timestamp)).strftime('%Y-%m-%d %H:%M:%S')
-        description = data.get('check', {}).get('output')
+        check_output = data.get('check', {}).get('output')
         status = data.get('check', {}).get('status')
 
         severity_map = {
@@ -84,44 +98,47 @@ class SfdcHandler(Handler):
 
         sfdc_client = Client(sfdc_oauth2)
         # read cached token if it exists
-        try:
-            with open(token_cache_file, 'r') as fp:
-                cached_tokens = yaml.load(fp)
-        except IOError:
-            cached_tokens = None
-        if cached_tokens:
-            sfdc_client.access_token = cached_tokens['access']
-            sfdc_client.instance_url = cached_tokens['instance_url']
+        if token_cache_file:
+            try:
+                with open(token_cache_file, 'r') as fp:
+                    cached_tokens = yaml.load(fp)
+            except IOError as e:
+                cached_tokens = None
+                LOG.debug('Error reading token_cache_file')
+                LOG.debug(e)
+            if isinstance(cached_tokens, dict) and 'access' in cached_tokens \
+                    and 'instance_url' in cached_tokens:
 
-            test_response = sfdc_client.get_case('case_id_that_doesnt_exist')
-            if test_response.status_code == 401:
-                # If auth fails, reset tokens to None to force re-auth.
-                sfdc_client.access_token = None
-                sfdc_client.instance_url = None
-                LOG.debug('Cached access token expired.  Going to re-auth.')
-            else:
-                LOG.debug('Using cached access token.')
+                sfdc_client.access_token = cached_tokens['access']
+                sfdc_client.instance_url = cached_tokens['instance_url']
+
+                #TODO: There's probably better way to handle this test.
+                test_response = sfdc_client.get_case('case_id_that_doesnt_exist')
+                if test_response.status_code == 401:
+                    # If auth fails, reset tokens to None to force re-auth.
+                    sfdc_client.access_token = None
+                    sfdc_client.instance_url = None
+                    LOG.debug('Cached access token expired.  Going to re-auth.')
+                else:
+                    LOG.debug('Using cached access token.')
 
         print "severity", severity
-        print "check_action", check_action #resolve, create
-        print "description", description
+        print "check_action", check_action
+        print "check_output", check_output
         print "long_date_time", check_date
         print "environment", environment
         print "NOTIFICATION", notification
-#        severity = "CRITICAL"
-#        notification = "PROBLEM"
-#        check_date = "Wed Sep 7 14:09:58 CEST 2016"
         payload = {
             'notification_type': notification,
-            'description':       description,
+            'check_output':      check_output,
             'long_date_time':    check_date,
         }
-
 
         subject = "{}/{}".format(client_host, check_name)
         data = {
             'IsMosAlert__c':     'true',
-            'Description':       json.dumps(payload, sort_keys=True, indent=4),
+            #'Description':       json.dumps(payload, sort_keys=True, indent=4),
+            'Description':       self._format_body(payload),
             'Alert_ID__c':       Alert_ID,
             'Subject':           subject,
             'Environment2__c':   environment,
@@ -202,8 +219,8 @@ class SfdcHandler(Handler):
                     feeditem_data = {
                       'ParentId':   CaseId,
                       'Visibility': 'AllUsers',
-                      'Body': json.dumps(feed_data_body, sort_keys=True, indent=4),
-                      #'Body': format_feed_body(feed_data_body),
+                      #'Body': json.dumps(feed_data_body, sort_keys=True, indent=4),
+                      'Body': self._format_body(feed_data_body),
                     }
                     LOG.debug("FeedItem Data: {}".format(json.dumps(feeditem_data,
                                                                     sort_keys=True,
@@ -226,8 +243,8 @@ class SfdcHandler(Handler):
                 feeditem_data = {
                     'ParentId':   ExistingCaseId,
                     'Visibility': 'AllUsers',
-                    'Body': json.dumps(feed_data_body, sort_keys=True, indent=4),
-                    #'Body': format_feed_body(feed_data_body),
+                    #'Body': json.dumps(feed_data_body, sort_keys=True, indent=4),
+                    'Body': self._format_body(feed_data_body),
                 }
 
                 LOG.debug("FeedItem Data: {}".format(json.dumps(feeditem_data,
@@ -252,8 +269,8 @@ class SfdcHandler(Handler):
             feeditem_data = {
               'ParentId':   CaseId,
               'Visibility': 'AllUsers',
-              'Body': json.dumps(feed_data_body, sort_keys=True, indent=4),
-              #'Body': format_feed_body(feed_data_body),
+              #'Body': json.dumps(feed_data_body, sort_keys=True, indent=4),
+              'Body': self._format_body(feed_data_body),
      
             }
             LOG.debug("FeedItem Data: {}".format(json.dumps(feeditem_data,
@@ -276,13 +293,15 @@ class SfdcHandler(Handler):
                       "and Case does not exist (code != 400)")
 
 
-
-
-
         # Write out token/instance_url
-        with open(token_cache_file, 'w') as fp:
-            fp.write("access: {}\n".format(sfdc_client.access_token))
-            fp.write("instance_url: {}\n".format(sfdc_client.instance_url))
+        if token_cache_file:
+            try:
+                with open(token_cache_file, 'w') as fp:
+                    fp.write("access: {}\n".format(sfdc_client.access_token))
+                    fp.write("instance_url: {}\n".format(sfdc_client.instance_url))
+            except IOError as e:
+                LOG.debug('Error writing out token cache.')
+                LOG.debug(e)
 
         sys.exit(1)
 
