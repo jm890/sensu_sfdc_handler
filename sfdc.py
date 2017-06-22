@@ -38,13 +38,14 @@ class SfdcHandler(Handler):
         auth_url = self.settings.get('sfdc', {}).get('sfdc_auth_url')
         organization_id = self.settings.get('sfdc', {}).get('sfdc_organization_id')
         environment = self.settings.get('sfdc', {}).get('environment')
+        token_cache_file = self.settings.get('sfdc', {}).get('token_cache_file')
+
         print self.event
         print "client_id: ", client_id
         print "client_secrete: ", client_secret
         print "auth_url: ", auth_url
         print "organization: ", organization_id
         print "username: ", username
-#        print "password", password
         sfdc_oauth2 = OAuth2(client_id, client_secret, username, password, auth_url, organization_id)
 
         data = self.event
@@ -55,6 +56,7 @@ class SfdcHandler(Handler):
         check_date = datetime.fromtimestamp(int(timestamp)).strftime('%Y-%m-%d %H:%M:%S')
         description = data.get('check', {}).get('output')
         status = data.get('check', {}).get('status')
+
         severity_map = {
             0: '060 Informational',
             1: '080 Warning',
@@ -81,6 +83,24 @@ class SfdcHandler(Handler):
         LOG.debug('Alert_Id: {} '.format(Alert_ID))
 
         sfdc_client = Client(sfdc_oauth2)
+        # read cached token if it exists
+        try:
+            with open(token_cache_file, 'r') as fp:
+                cached_tokens = yaml.load(fp)
+        except IOError:
+            cached_tokens = None
+        if cached_tokens:
+            sfdc_client.access_token = cached_tokens['access']
+            sfdc_client.instance_url = cached_tokens['instance_url']
+
+            test_response = sfdc_client.get_case('case_id_that_doesnt_exist')
+            if test_response.status_code == 401:
+                # If auth fails, reset tokens to None to force re-auth.
+                sfdc_client.access_token = None
+                sfdc_client.instance_url = None
+                LOG.debug('Cached access token expired.  Going to re-auth.')
+            else:
+                LOG.debug('Using cached access token.')
 
         print "severity", severity
         print "check_action", check_action #resolve, create
@@ -95,20 +115,20 @@ class SfdcHandler(Handler):
             'notification_type': notification,
             'description':       description,
             'long_date_time':    check_date,
-             }
+        }
 
+
+        subject = "{}/{}".format(client_host, check_name)
         data = {
             'IsMosAlert__c':     'true',
             'Description':       json.dumps(payload, sort_keys=True, indent=4),
             'Alert_ID__c':       Alert_ID,
-            'Subject':           Alert_ID,
+            'Subject':           subject,
             'Environment2__c':   environment,
             'Alert_Priority__c': severity,
             'Alert_Host__c':     client_host,
             'Alert_Service__c':  check_name,
-
-        #        'sort_marker__c': sort_marker,
-            }
+        }
 
         feed_data_body = {
             'Description':    payload,
@@ -116,7 +136,7 @@ class SfdcHandler(Handler):
             'Cloud_ID':       environment,
             'Alert_Priority': severity,
             'Status':         "New",
-            }
+        }
 
         try:
             new_case = sfdc_client.create_case(data)
@@ -125,55 +145,81 @@ class SfdcHandler(Handler):
             sys.exit(1)
 
 
-
         #  If Case exist
-        if (new_case.status_code  == 400) and (new_case.json()[0]['errorCode'] == 'DUPLICATE_VALUE'):
-            LOG.debug('Code: {}, Error message: {} '.format(new_case.status_code, new_case.text))
+        if (new_case.status_code == 400) and \
+                (new_case.json()[0]['errorCode'] == 'DUPLICATE_VALUE'):
+
+            LOG.debug('Code: {}, Error message: {} '.format(new_case.status_code,
+                                                            new_case.text))
             # Find Case ID
             ExistingCaseId = new_case.json()[0]['message'].split(" ")[-1]
             LOG.debug('ExistingCaseId: {} '.format(ExistingCaseId))
-            # Get Case 
+            # Get Case
             current_case = sfdc_client.get_case(ExistingCaseId).json()
-            LOG.debug("Existing Case: \n {}".format(json.dumps(current_case,sort_keys=True, indent=4)))
+            LOG.debug("Existing Case: \n {}".format(json.dumps(current_case,
+                                                    sort_keys=True, indent=4)))
 
-            LastModifiedDate=current_case['LastModifiedDate']
-            Now=datetime.now().replace(tzinfo=None)
+            LastModifiedDate = current_case['LastModifiedDate']
+            ExistingCaseStatus = current_case['Status']
+            feed_data_body['Status'] = ExistingCaseStatus
+
+            Now = datetime.now().replace(tzinfo=None)
             delta = Now - dateutil.parser.parse(LastModifiedDate).replace(tzinfo=None)
 
-            LOG.debug("Check if Case should be marked as OUTDATED. Case modification date is: {} , Now: {} , Delta(sec): {}, OutdateDelta(sec): {}".format(LastModifiedDate, Now, delta.seconds, DELTA_SECONDS))
+            LOG.debug("Check if Case should be marked as OUTDATED. Case "
+                      "modification date is: {} , Now: {} , Delta(sec): {}, "
+                      "OutdateDelta(sec): {}".format(LastModifiedDate, Now,
+                                                     delta.seconds, DELTA_SECONDS))
+
             if (delta.seconds > DELTA_SECONDS):
                 # Old Case is outdated
+                tmp_date = datetime.strftime(datetime.now(), "%Y.%m.%d-%H:%M:%S")
                 new_data = {
-                   'Alert_Id__c': '{}_closed_at_{}'.format(current_case['Alert_ID__c'],datetime.strftime(datetime.now(), "%Y.%m.%d-%H:%M:%S")),
+                   'Alert_Id__c': '{}_closed_at_{}'.format(current_case['Alert_ID__c'],
+                                                           tmp_date),
                    'Alert_Priority__c': '000 OUTDATED',
                 }
                 u = sfdc_client.update_case(id=ExistingCaseId, data=new_data)
-                LOG.debug('Upate status code: {} \n\nUpate content: {}\n\n Upate headers: {}\n\n'.format(u.status_code,u.content, u.headers))
+                LOG.debug('Update status code: {} \n\nUpdate content: {}'
+                          '\n\n Update headers: {}\n\n'.format(u.status_code,
+                                                               u.content,
+                                                               u.headers))
 
-                # Try to create new caset again 
+                # Try to create new case again
                 try:
                     new_case = sfdc_client.create_case(data)
                 except Exception as E:
                     LOG.debug(E)
                     sys.exit(1)
                 else:
-                   # Case was outdated an new was created
+                    # Case was outdated an new was created
                     CaseId = new_case.json()['id']
-                    LOG.debug("Case was just created, old one was marked as Outdated")
-                    # Add commnet, because Case head should conains  LAST data  overriden on any update
+                    LOG.debug("Case was just created, old one marked as Outdated")
+                    # Add comment, because Case head should contains LAST data
+                    # overwritten on any update
                     CaseId = new_case.json()['id']
 
                     feeditem_data = {
                       'ParentId':   CaseId,
                       'Visibility': 'AllUsers',
                       'Body': json.dumps(feed_data_body, sort_keys=True, indent=4),
+                      #'Body': format_feed_body(feed_data_body),
                     }
-                    LOG.debug("FeedItem Data: {}".format(json.dumps(feeditem_data, sort_keys=True, indent=4)))
+                    LOG.debug("FeedItem Data: {}".format(json.dumps(feeditem_data,
+                                                                    sort_keys=True,
+                                                                    indent=4)))
                     add_feed_item = sfdc_client.create_feeditem(feeditem_data)
-                    LOG.debug('Add FeedItem status code: {} \n Add FeedItem reply: {} '.format(add_feed_item.status_code, add_feed_item.text))
+                    LOG.debug('Add FeedItem status code: {}\nAdd FeedItem '
+                              'reply: {}'.format(add_feed_item.status_code,
+                                                 add_feed_item.text))
 
             else:
                 # Update Case
+                # If ok, mark case as solved.
+                if notification == "RECOVERY":
+                    data['Status'] = 'Solved'
+                    feed_data_body['Status'] = 'Solved'
+
                 u = sfdc_client.update_case(id=ExistingCaseId, data=data)
                 LOG.debug('Upate status code: {} '.format(u.status_code))
 
@@ -181,28 +227,63 @@ class SfdcHandler(Handler):
                     'ParentId':   ExistingCaseId,
                     'Visibility': 'AllUsers',
                     'Body': json.dumps(feed_data_body, sort_keys=True, indent=4),
+                    #'Body': format_feed_body(feed_data_body),
                 }
 
-                LOG.debug("FeedItem Data: {}".format(json.dumps(feeditem_data, sort_keys=True, indent=4)))
+                LOG.debug("FeedItem Data: {}".format(json.dumps(feeditem_data,
+                                                                sort_keys=True,
+                                                                indent=4)))
                 add_feed_item = sfdc_client.create_feeditem(feeditem_data)
-                LOG.debug('Add FeedItem status code: {} \n Add FeedItem reply: {} '.format(add_feed_item.status_code, add_feed_item.text))
+                LOG.debug('Add FeedItem status code: {}\nAdd FeedItem '
+                          'reply: {} '.format(add_feed_item.status_code,
+                                              add_feed_item.text))
 
-        # Else If Case did not exist before and was just  created
-        elif  (new_case.status_code  == 201):
+        # Else If Case did not exist before and was just created
+        elif (new_case.status_code == 201):
             LOG.debug("Case was just created")
-            # Add commnet, because Case head should conains  LAST data  overriden on any update
+
+            # Add comment, because Case head should contain LAST data
+            # overwritten on any update
             CaseId = new_case.json()['id']
+
+            # If OK, ensure "Solved" is in the first feed.
+            if notification == "RECOVERY":
+                feed_data_body['Status'] = 'Solved'
             feeditem_data = {
               'ParentId':   CaseId,
               'Visibility': 'AllUsers',
               'Body': json.dumps(feed_data_body, sort_keys=True, indent=4),
+              #'Body': format_feed_body(feed_data_body),
+     
             }
-            LOG.debug("FeedItem Data: {}".format(json.dumps(feeditem_data, sort_keys=True, indent=4)))
+            LOG.debug("FeedItem Data: {}".format(json.dumps(feeditem_data,
+                                                            sort_keys=True,
+                                                            indent=4)))
             add_feed_item = sfdc_client.create_feeditem(feeditem_data)
-            LOG.debug('Add FeedItem status code: {} \n Add FeedItem reply: {} '.format(add_feed_item.status_code, add_feed_item.text))
+            LOG.debug('Add FeedItem status code: {}\nAdd FeedItem '
+                      'reply: {} '.format(add_feed_item.status_code,
+                                          add_feed_item.text))
+
+            # If OK, mark case as solved.
+            if notification == "RECOVERY":
+                data['Status'] = 'Solved'
+
+            u = sfdc_client.update_case(id=CaseId, data=data)
+            LOG.debug('Update status code: {} '.format(u.status_code))
 
         else:
-            LOG.debug("Unexpected error: Case was not created (code !=201) and Case does not exist (code != 400)")
+            LOG.debug("Unexpected error: Case was not created (code !=201) "
+                      "and Case does not exist (code != 400)")
+
+
+
+
+
+        # Write out token/instance_url
+        with open(token_cache_file, 'w') as fp:
+            fp.write("access: {}\n".format(sfdc_client.access_token))
+            fp.write("instance_url: {}\n".format(sfdc_client.instance_url))
+
         sys.exit(1)
 
     def check_kedb(self):
